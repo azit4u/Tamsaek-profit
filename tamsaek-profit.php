@@ -15,8 +15,7 @@ define( 'TAMSAEK_PROFIT_VERSION', '1.0' );
 
 class Tamsaek_Profit {
 
-	const TABLE    = 'tamsaek_profit_daily';
-	const PER_PAGE = 15;
+	const TABLE = 'tamsaek_profit_daily';
 
 	private $plugin_base;
 
@@ -169,7 +168,7 @@ class Tamsaek_Profit {
 				<li>어제 / 이번 달 / 저번 달 / 올해 누적 순수익 카드</li>
 				<li>환율 자동 조회 (ECB 공식 → KITA 매매기준율 순)</li>
 				<li>페이지 RPM 입력 → 월간 가중평균 RPM 자동 계산</li>
-				<li>입력 내역 페이징 목록, 수정·삭제</li>
+				<li>입력 내역 년·월별 조회, 수정·삭제, 모바일 카드형</li>
 			</ul>
 			<h4>참고</h4>
 			<ul>
@@ -199,8 +198,8 @@ class Tamsaek_Profit {
 
 	public function admin_menu() {
 		add_menu_page(
-			'수익 대시보드',
-			'수익 대시보드',
+			'광고수익 대시보드',
+			'탐색 광고수익',
 			'manage_options',
 			'tamsaek-profit',
 			array( $this, 'render_page' ),
@@ -216,7 +215,8 @@ class Tamsaek_Profit {
 		check_admin_referer( 'tamsaek_profit_save' );
 
 		$date = isset( $_POST['entry_date'] ) ? sanitize_text_field( wp_unslash( $_POST['entry_date'] ) ) : '';
-		if ( ! preg_match( '/^\d{4}-\d{2}-\d{2}$/', $date ) ) {
+		$parsed_date = DateTimeImmutable::createFromFormat( '!Y-m-d', $date, wp_timezone() );
+		if ( ! $parsed_date || $parsed_date->format( 'Y-m-d' ) !== $date ) {
 			wp_die( '날짜 형식이 올바르지 않습니다.' );
 		}
 
@@ -226,30 +226,75 @@ class Tamsaek_Profit {
 			wp_die( '오늘 이후 날짜는 입력할 수 없습니다. 어제까지의 확정치만 입력하세요.' );
 		}
 
-		$usd = round( floatval( $_POST['adsense_usd'] ?? 0 ), 2 );
-		$rpm = floatval( $_POST['page_rpm'] ?? 0 );
+		$usd_raw     = sanitize_text_field( wp_unslash( $_POST['adsense_usd'] ?? '' ) );
+		$rate_raw    = sanitize_text_field( wp_unslash( $_POST['exchange_rate'] ?? '' ) );
+		$adspend_raw = sanitize_text_field( wp_unslash( $_POST['adspend_krw'] ?? '' ) );
+		$rpm_raw     = sanitize_text_field( wp_unslash( $_POST['page_rpm'] ?? '' ) );
+
+		if ( ! is_numeric( $usd_raw ) || ! is_numeric( $rate_raw ) || ! is_numeric( $adspend_raw ) || ( '' !== $rpm_raw && ! is_numeric( $rpm_raw ) ) ) {
+			wp_die( '금액과 RPM은 숫자로 입력하세요.' );
+		}
+
+		$usd     = round( floatval( $usd_raw ), 2 );
+		$rate    = round( floatval( $rate_raw ), 2 );
+		$adspend = round( floatval( $adspend_raw ) );
+		$rpm     = '' === $rpm_raw ? 0 : floatval( $rpm_raw );
+
+		if ( ! is_finite( $usd ) || ! is_finite( $rate ) || ! is_finite( $adspend ) || ! is_finite( $rpm ) || $usd < 0 || $rate <= 0 || $adspend < 0 || $rpm < 0 ) {
+			wp_die( '수익·광고비·RPM은 0 이상, 환율은 0보다 큰 값으로 입력하세요.' );
+		}
+
 		// RPM을 직접 입력받고 페이지뷰는 역산해 저장한다 (월간 RPM 가중평균 계산용).
 		$pageviews = $rpm > 0 ? (int) round( $usd / $rpm * 1000 ) : 0;
 
 		global $wpdb;
-
-		// 수정 모드에서 날짜를 바꾼 경우: 원래 행을 지워서 중복 생성을 막는다.
+		$table   = $this->table();
 		$edit_id = absint( $_POST['edit_id'] ?? 0 );
-		if ( $edit_id ) {
-			$wpdb->delete( $this->table(), array( 'id' => $edit_id ), array( '%d' ) );
+		$data    = array(
+			'entry_date'    => $date,
+			'adsense_usd'   => $usd,
+			'exchange_rate' => $rate,
+			'adspend_krw'   => $adspend,
+			'pageviews'     => $pageviews,
+		);
+		$formats = array( '%s', '%f', '%f', '%f', '%d' );
+
+		if ( false === $wpdb->query( 'START TRANSACTION' ) ) {
+			wp_die( '저장을 시작하지 못했습니다. 잠시 후 다시 시도하세요.' );
 		}
 
-		$wpdb->replace(
-			$this->table(),
-			array(
-				'entry_date'    => $date,
-				'adsense_usd'   => $usd,
-				'exchange_rate' => round( floatval( $_POST['exchange_rate'] ?? 0 ), 2 ),
-				'adspend_krw'   => round( floatval( $_POST['adspend_krw'] ?? 0 ) ),
-				'pageviews'     => $pageviews,
-			),
-			array( '%s', '%f', '%f', '%f', '%d' )
-		);
+		$save_ok    = true;
+		$save_error = '';
+		if ( $edit_id ) {
+			$original_id = $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$table} WHERE id = %d FOR UPDATE", $edit_id ) );
+			if ( ! $original_id ) {
+				$save_ok    = false;
+				$save_error = '수정할 데이터를 찾지 못했습니다.';
+			} else {
+				$target_id = $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$table} WHERE entry_date = %s FOR UPDATE", $date ) );
+				if ( $target_id && (int) $target_id !== $edit_id ) {
+					$save_ok    = false;
+					$save_error = $date . '에는 이미 저장된 데이터가 있습니다. 해당 날짜의 항목을 직접 수정하세요.';
+				} else {
+					$save_ok = false !== $wpdb->update( $table, $data, array( 'id' => $edit_id ), $formats, array( '%d' ) );
+				}
+			}
+		} else {
+			$target_id = $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$table} WHERE entry_date = %s FOR UPDATE", $date ) );
+			$save_ok   = $target_id
+				? false !== $wpdb->update( $table, $data, array( 'id' => (int) $target_id ), $formats, array( '%d' ) )
+				: false !== $wpdb->insert( $table, $data, $formats );
+		}
+
+		if ( ! $save_ok ) {
+			$wpdb->query( 'ROLLBACK' );
+			wp_die( $save_error ? esc_html( $save_error ) : '저장하지 못했습니다. 기존 데이터는 변경되지 않았습니다.' );
+		}
+
+		if ( false === $wpdb->query( 'COMMIT' ) ) {
+			$wpdb->query( 'ROLLBACK' );
+			wp_die( '저장을 완료하지 못했습니다. 잠시 후 다시 시도하세요.' );
+		}
 
 		wp_safe_redirect( admin_url( 'admin.php?page=tamsaek-profit&saved=1' ) );
 		exit;
@@ -263,7 +308,13 @@ class Tamsaek_Profit {
 		check_admin_referer( 'tamsaek_profit_delete_' . $id );
 
 		global $wpdb;
-		$wpdb->delete( $this->table(), array( 'id' => $id ), array( '%d' ) );
+		$deleted = $wpdb->delete( $this->table(), array( 'id' => $id ), array( '%d' ) );
+		if ( false === $deleted ) {
+			wp_die( '삭제하지 못했습니다. 잠시 후 다시 시도하세요.' );
+		}
+		if ( 0 === $deleted ) {
+			wp_die( '삭제할 데이터를 찾지 못했습니다. 이미 삭제되었을 수 있습니다.' );
+		}
 
 		wp_safe_redirect( admin_url( 'admin.php?page=tamsaek-profit&deleted=1' ) );
 		exit;
@@ -433,28 +484,37 @@ class Tamsaek_Profit {
 			array( '올해 누적 순수익', $this->card_data( $year_first, $year_last ), false ),
 		);
 
-		// 목록 + 페이징.
-		$paged  = max( 1, absint( $_GET['paged'] ?? 1 ) );
-		$total  = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$table}" );
-		$pages  = max( 1, (int) ceil( $total / self::PER_PAGE ) );
-		$paged  = min( $paged, $pages );
-		$offset = ( $paged - 1 ) * self::PER_PAGE;
+		// 목록: 년·월 선택 (기본 이번 달).
+		$cur_year  = (int) $today->format( 'Y' );
+		$cur_month = (int) $today->format( 'n' );
+		$sel_year  = isset( $_GET['y'] ) ? absint( $_GET['y'] ) : $cur_year;
+		$sel_month = isset( $_GET['m'] ) ? absint( $_GET['m'] ) : $cur_month;
+		if ( $sel_month < 1 || $sel_month > 12 ) {
+			$sel_month = $cur_month;
+		}
+
+		$min_date  = $wpdb->get_var( "SELECT MIN(entry_date) FROM {$table}" );
+		$min_year  = $min_date ? (int) substr( $min_date, 0, 4 ) : $cur_year;
+		if ( $sel_year < $min_year || $sel_year > $cur_year ) {
+			$sel_year = $cur_year;
+		}
+
+		$list_first = sprintf( '%04d-%02d-01', $sel_year, $sel_month );
+		$list_last  = gmdate( 'Y-m-t', strtotime( $list_first ) );
+		$month_sum  = $this->card_data( $list_first, $list_last );
 
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
-				"SELECT * FROM {$table} ORDER BY entry_date DESC LIMIT %d OFFSET %d",
-				self::PER_PAGE,
-				$offset
+				"SELECT * FROM {$table} WHERE entry_date BETWEEN %s AND %s ORDER BY entry_date DESC",
+				$list_first,
+				$list_last
 			),
 			ARRAY_A
 		);
 
-		// 입력 폼 기본값: 어제 날짜, 마지막으로 입력한 환율.
-		$last_rate = $wpdb->get_var( "SELECT exchange_rate FROM {$table} ORDER BY entry_date DESC LIMIT 1" );
-		$last_rate = $last_rate ? floatval( $last_rate ) : '';
 		?>
 		<div class="wrap apd-wrap">
-			<h1>수익 대시보드</h1>
+			<h1>광고수익 대시보드</h1>
 
 			<?php if ( isset( $_GET['saved'] ) ) : ?>
 				<div class="notice notice-success is-dismissible"><p>저장했습니다.</p></div>
@@ -494,32 +554,32 @@ class Tamsaek_Profit {
 				<div class="apd-panel">
 					<h2 class="apd-panel__title">일별 입력</h2>
 					<p id="apd-edit-note" class="apd-edit-note" hidden></p>
-					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" autocomplete="off">
 						<?php wp_nonce_field( 'tamsaek_profit_save' ); ?>
 						<input type="hidden" name="action" value="tamsaek_profit_save">
 						<input type="hidden" name="edit_id" id="apd-edit-id" value="">
 
 						<div class="apd-field">
 							<label for="apd-date">날짜</label>
-							<input type="date" id="apd-date" name="entry_date" value="<?php echo esc_attr( $yesterday ); ?>" max="<?php echo esc_attr( $yesterday ); ?>" required>
+							<input type="date" id="apd-date" name="entry_date" value="" max="<?php echo esc_attr( $yesterday ); ?>" autocomplete="off" required>
 							<span class="apd-hint">어제까지만 입력할 수 있습니다 (확정치 기준).</span>
 						</div>
 						<div class="apd-field">
 							<label for="apd-usd">애드센스 수익 ($)</label>
-							<input type="number" step="0.01" min="0" id="apd-usd" name="adsense_usd" placeholder="399.81" required>
+							<input type="number" step="0.01" min="0" id="apd-usd" name="adsense_usd" autocomplete="off" required>
 						</div>
 						<div class="apd-field">
 							<label for="apd-rate">환율 (₩/$)</label>
-							<input type="number" step="0.01" min="0" id="apd-rate" name="exchange_rate" value="<?php echo esc_attr( $last_rate ); ?>" placeholder="1420" required>
+							<input type="number" step="0.01" min="0" id="apd-rate" name="exchange_rate" value="" autocomplete="off" required>
 							<span id="apd-rate-status" class="apd-hint"></span>
 						</div>
 						<div class="apd-field">
 							<label for="apd-adspend">광고비 (₩)</label>
-							<input type="number" step="1" min="0" id="apd-adspend" name="adspend_krw" placeholder="333490" required>
+							<input type="number" step="1" min="0" id="apd-adspend" name="adspend_krw" autocomplete="off" required>
 						</div>
 						<div class="apd-field">
 							<label for="apd-rpm">페이지 RPM ($)</label>
-							<input type="number" step="0.01" min="0" id="apd-rpm" name="page_rpm" placeholder="62.15">
+							<input type="number" step="0.01" min="0" id="apd-rpm" name="page_rpm" autocomplete="off">
 							<span class="apd-hint">애드센스 실적의 "페이지 RPM" 그대로 입력</span>
 						</div>
 
@@ -529,8 +589,27 @@ class Tamsaek_Profit {
 				</div>
 			</div>
 
-			<h2 class="apd-list-title">입력 내역 <span class="apd-count">(총 <?php echo esc_html( number_format( $total ) ); ?>일)</span></h2>
-			<table class="widefat striped apd-table">
+			<div class="apd-list-head">
+				<h2 class="apd-list-title">입력 내역</h2>
+				<form method="get" class="apd-month-form">
+					<input type="hidden" name="page" value="tamsaek-profit">
+					<select name="y" onchange="this.form.submit()">
+						<?php for ( $y = $cur_year; $y >= $min_year; $y-- ) : ?>
+							<option value="<?php echo esc_attr( $y ); ?>" <?php selected( $y, $sel_year ); ?>><?php echo esc_html( $y ); ?>년</option>
+						<?php endfor; ?>
+					</select>
+					<select name="m" onchange="this.form.submit()">
+						<?php for ( $mo = 1; $mo <= 12; $mo++ ) : ?>
+							<option value="<?php echo esc_attr( $mo ); ?>" <?php selected( $mo, $sel_month ); ?>><?php echo esc_html( $mo ); ?>월</option>
+						<?php endfor; ?>
+					</select>
+					<span class="apd-month-sum">
+						순수익 <strong class="<?php echo $month_sum['net'] >= 0 ? 'apd-net-plus' : 'apd-net-minus'; ?>">₩<?php echo esc_html( number_format( $month_sum['net'] ) ); ?></strong>
+						· <?php echo esc_html( count( $rows ) ); ?>일
+					</span>
+				</form>
+			</div>
+			<table class="apd-table">
 				<thead>
 					<tr>
 						<th>날짜</th>
@@ -545,28 +624,36 @@ class Tamsaek_Profit {
 				</thead>
 				<tbody>
 					<?php if ( ! $rows ) : ?>
-						<tr><td colspan="8">아직 입력된 데이터가 없습니다. 오른쪽 입력 폼에 어제 값을 넣어보세요.</td></tr>
+						<tr><td colspan="8" class="apd-empty"><?php echo esc_html( sprintf( '%d년 %d월에 입력된 데이터가 없습니다.', $sel_year, $sel_month ) ); ?></td></tr>
 					<?php endif; ?>
-					<?php foreach ( $rows as $r ) :
-						$usd  = floatval( $r['adsense_usd'] );
-						$rate = floatval( $r['exchange_rate'] );
-						$krw  = $usd * $rate;
-						$net  = $krw - floatval( $r['adspend_krw'] );
-						$rpm  = $r['pageviews'] > 0 ? $usd / $r['pageviews'] * 1000 : 0;
-						$del  = wp_nonce_url(
+					<?php
+					$weekdays = array( '일요일', '월요일', '화요일', '수요일', '목요일', '금요일', '토요일' );
+					foreach ( $rows as $r ) :
+						$usd          = floatval( $r['adsense_usd'] );
+						$rate         = floatval( $r['exchange_rate'] );
+						$krw          = $usd * $rate;
+						$net          = $krw - floatval( $r['adspend_krw'] );
+						$rpm          = $r['pageviews'] > 0 ? $usd / $r['pageviews'] * 1000 : 0;
+						$row_date     = DateTimeImmutable::createFromFormat( '!Y-m-d', $r['entry_date'], $tz );
+						$date_display = $row_date ? $row_date->format( 'Y. m. d' ) : $r['entry_date'];
+						$weekday      = $row_date ? $weekdays[ (int) $row_date->format( 'w' ) ] : '';
+						$del = wp_nonce_url(
 							admin_url( 'admin-post.php?action=tamsaek_profit_delete&id=' . absint( $r['id'] ) ),
 							'tamsaek_profit_delete_' . absint( $r['id'] )
 						);
 						?>
 						<tr>
-							<td><?php echo esc_html( $r['entry_date'] ); ?></td>
-							<td>$<?php echo esc_html( number_format( $usd, 2 ) ); ?></td>
-							<td><?php echo esc_html( number_format( $rate, 2 ) ); ?></td>
-							<td>₩<?php echo esc_html( number_format( $krw ) ); ?></td>
-							<td>₩<?php echo esc_html( number_format( floatval( $r['adspend_krw'] ) ) ); ?></td>
-							<td><strong class="<?php echo $net >= 0 ? 'apd-net-plus' : 'apd-net-minus'; ?>">₩<?php echo esc_html( number_format( $net ) ); ?></strong></td>
-							<td>$<?php echo esc_html( number_format( $rpm, 2 ) ); ?></td>
-							<td class="apd-col-actions">
+							<td data-label="날짜">
+								<span class="apd-date-main"><?php echo esc_html( $date_display ); ?></span>
+								<?php if ( $weekday ) : ?><span class="apd-date-day"><?php echo esc_html( $weekday ); ?></span><?php endif; ?>
+							</td>
+							<td data-label="애드센스 ($)">$<?php echo esc_html( number_format( $usd, 2 ) ); ?></td>
+							<td data-label="환율"><?php echo esc_html( number_format( $rate, 2 ) ); ?></td>
+							<td data-label="애드센스 (₩)">₩<?php echo esc_html( number_format( $krw ) ); ?></td>
+							<td data-label="광고비 (₩)">₩<?php echo esc_html( number_format( floatval( $r['adspend_krw'] ) ) ); ?></td>
+							<td data-label="순수익 (₩)"><strong class="<?php echo $net >= 0 ? 'apd-net-plus' : 'apd-net-minus'; ?>">₩<?php echo esc_html( number_format( $net ) ); ?></strong></td>
+							<td data-label="RPM ($)">$<?php echo esc_html( number_format( $rpm, 2 ) ); ?></td>
+							<td class="apd-col-actions" data-label="관리">
 								<a href="#" class="apd-edit"
 									data-id="<?php echo esc_attr( absint( $r['id'] ) ); ?>"
 									data-date="<?php echo esc_attr( $r['entry_date'] ); ?>"
@@ -583,26 +670,28 @@ class Tamsaek_Profit {
 				</tbody>
 			</table>
 
-			<?php if ( $pages > 1 ) : ?>
-				<div class="tablenav"><div class="tablenav-pages apd-paging">
-					<?php
-					echo paginate_links( // phpcs:ignore WordPress.Security.EscapeOutput
-						array(
-							'base'      => add_query_arg( 'paged', '%#%' ),
-							'format'    => '',
-							'current'   => $paged,
-							'total'     => $pages,
-							'prev_text' => '‹ 이전',
-							'next_text' => '다음 ›',
-						)
-					);
-					?>
-				</div></div>
-			<?php endif; ?>
 		</div>
 
 		<style>
-			.apd-wrap { max-width: 1200px; }
+			.apd-wrap {
+				max-width: 1200px;
+				font-family: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans KR", "Malgun Gothic", sans-serif;
+				font-size: 14px;
+				letter-spacing: -.15px;
+			}
+			.apd-wrap input,
+			.apd-wrap select,
+			.apd-wrap button,
+			.apd-wrap textarea,
+			.apd-wrap table {
+				font: inherit;
+			}
+			.apd-wrap input,
+			.apd-wrap select,
+			.apd-wrap button { letter-spacing: inherit; }
+			.apd-wrap strong,
+			.apd-wrap .apd-card__net,
+			.apd-wrap .apd-table td { font-variant-numeric: tabular-nums; }
 			.apd-wrap h1 { font-weight: 700; }
 
 			.apd-layout {
@@ -663,17 +752,143 @@ class Tamsaek_Profit {
 			.apd-hint { display: block; color: #98a2b3; font-size: 12px; margin-top: 6px; }
 			.apd-submit { width: 100%; margin-top: 10px; }
 
-			.apd-list-title { margin-top: 34px; }
-			.apd-count { color: #98a2b3; font-size: 14px; font-weight: 400; }
-			.apd-table { border-radius: 12px; overflow: hidden; }
-			.apd-table th { font-weight: 700; }
-			.apd-net-plus { color: #101828; }
+			.apd-list-head { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 34px; }
+			.apd-list-title { margin: 0; }
+			.apd-month-form { display: flex; align-items: center; gap: 8px; }
+			.apd-month-form select { border-radius: 8px; }
+			.apd-month-sum { color: #475467; font-size: 14px; margin-left: 4px; }
+			.apd-month-sum strong { font-size: 15px; }
+			.apd-table {
+				display: block;
+				border: 0;
+				box-shadow: none;
+				background: transparent;
+				margin-top: 12px;
+			}
+			.apd-table thead { display: none; }
+			.apd-table tbody {
+				display: grid;
+				grid-template-columns: repeat(3, minmax(0, 1fr));
+				gap: 14px;
+			}
+			@media (max-width: 1100px) {
+				.apd-table tbody { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+			}
+			.apd-table tr {
+				display: grid;
+				grid-template-columns: repeat(4, minmax(0, 1fr));
+				align-items: start;
+				gap: 0;
+				overflow: hidden;
+				background: #fff;
+				border: 0;
+				border-radius: 16px;
+				box-shadow: 0 5px 16px rgba(23, 60, 45, .055);
+			}
+			.apd-table td {
+				display: block;
+				border: 0;
+				padding: 12px 14px;
+				min-width: 0;
+				font-size: 14px;
+				color: #101828;
+			}
+			.apd-table td::before {
+				display: block;
+				margin-bottom: 4px;
+				color: #89958e;
+				font-size: 11px;
+				font-weight: 500;
+				content: attr(data-label);
+			}
+			.apd-table td[data-label="날짜"] {
+				order: 1;
+				grid-column: 1 / 3;
+				padding: 16px 16px 14px;
+				border-bottom: 1px solid #f2f4f3;
+				font-size: 16px;
+				font-weight: 800;
+			}
+			.apd-table td[data-label="날짜"]::before { content: "날짜"; }
+			.apd-date-main { display: block; }
+			.apd-date-day {
+				display: block;
+				margin-top: 4px;
+				color: #89958e;
+				font-size: 12px;
+				font-weight: 500;
+			}
+			.apd-table td[data-label="순수익 (₩)"] {
+				order: 2;
+				grid-column: 3 / 5;
+				padding: 14px 16px 12px;
+				border-bottom: 1px solid #f2f4f3;
+				text-align: right;
+			}
+			.apd-table td[data-label="순수익 (₩)"]::before { content: "순수익"; }
+			.apd-table td[data-label="순수익 (₩)"] strong {
+				display: block;
+				font-size: 24px;
+				font-weight: 800;
+				line-height: 1.15;
+				letter-spacing: -.5px;
+			}
+			.apd-table td[data-label="애드센스 ($)"] { order: 3; grid-column: span 2; }
+			.apd-table td[data-label="환율"] { order: 4; grid-column: span 2; }
+			.apd-table td[data-label="애드센스 (₩)"] { order: 5; grid-column: span 2; }
+			.apd-table td[data-label="광고비 (₩)"] { order: 6; grid-column: span 2; }
+			.apd-table td[data-label="RPM ($)"] {
+				order: 7;
+				grid-column: 1 / 3;
+				border-top: 1px solid #f0f3f1;
+				color: #1d6ae5;
+				font-weight: 800;
+			}
+			.apd-table td.apd-col-actions {
+				order: 8;
+				grid-column: 3 / 5;
+				border-top: 1px solid #f0f3f1;
+				text-align: right;
+			}
+			.apd-table td.apd-col-actions::before { display: none; }
+			.apd-table td.apd-empty { grid-column: 1 / -1; text-align: center; color: #98a2b3; }
+			.apd-table td.apd-empty::before { display: none; }
+			.apd-net-plus { color: #139958; }
 			.apd-net-minus { color: #e5484d; }
 			.apd-col-actions { text-align: right; white-space: nowrap; }
 			.apd-sep { color: #d0d5dd; margin: 0 2px; }
 			.apd-edit { color: #1d6ae5; text-decoration: none; }
 			.apd-delete { color: #b91c1c; text-decoration: none; }
-			.apd-paging { float: none; text-align: center; margin: 14px 0; }
+
+			/* 모바일: 날짜와 순수익을 강조한 독립 카드 */
+			@media (max-width: 782px) {
+				.apd-list-head { align-items: flex-start; }
+				.apd-month-form { flex-wrap: wrap; }
+				.apd-month-sum { flex: 0 0 100%; margin-left: 0; }
+				.apd-table tbody { grid-template-columns: 1fr; gap: 12px; }
+				.apd-table tr {
+					grid-template-columns: repeat(2, minmax(0, 1fr));
+				}
+				.apd-table td[data-label="날짜"] {
+					grid-column: 1;
+					font-size: 15px;
+				}
+				.apd-table td[data-label="순수익 (₩)"] {
+					grid-column: 2;
+				}
+				.apd-table td[data-label="순수익 (₩)"] strong {
+					font-size: 27px;
+				}
+				.apd-table td[data-label="애드센스 ($)"],
+				.apd-table td[data-label="환율"],
+				.apd-table td[data-label="애드센스 (₩)"],
+				.apd-table td[data-label="광고비 (₩)"] {
+					grid-column: span 1;
+				}
+				.apd-table td[data-label="RPM ($)"] { grid-column: 1; }
+				.apd-table td.apd-col-actions { grid-column: 2; }
+				.apd-table td.apd-empty { grid-column: 1 / -1; text-align: center; }
+			}
 		</style>
 
 		<script>
@@ -734,9 +949,17 @@ class Tamsaek_Profit {
 
 			function clearEditMode() {
 				editIdIn.value = '';
+				dateInput.value = '';
+				usdInput.value = '';
+				rateInput.value = '';
+				spendIn.value = '';
+				rpmInput.value = '';
+				status.textContent = '';
+				lastFetched = '';
 				editNote.hidden = true;
 				editNote.textContent = '';
 			}
+			window.addEventListener('pageshow', clearEditMode);
 
 			// 목록의 "수정" 클릭 → 해당 행 값을 폼에 채우고 수정 모드로 전환.
 			// 수정 모드에서 날짜를 바꾸면 그 행이 새 날짜로 "이동"한다 (중복 생성 안 됨).
